@@ -40,7 +40,11 @@ st.markdown("""
 st.title("小红花数据分析系统-加权版")
 st.write("""
 **系统说明**  
-本网页根据2025.4.4版本的小红花系统导出数据、花名册数据生成，如果输入数据有变更，产出可能出错，需要与管理员联系。
+本网页根据2025.4.4版本的小红花系统导出数据、花名册数据生成，如果输入数据有变更，产出可能出错，需要与管理员联系。  
+**权重规则说明：​**  
+为鼓励跨职能协作：  
+- 总部跨中心小红花计1朵，中心内小红花设置权重（0-1，具体可选）  
+- 城市跨部门小红花计1朵，部门内小红花设置权重（0-1，具体可选，与总部中心内一致）
 """)
 
 # 文件上传组件
@@ -59,7 +63,7 @@ if uploaded_flower_file and uploaded_employee_file:
 def validate_data(flower_df, employee_df):
     """数据验证函数"""
     required_flower_columns = {'收花人系统号', '送花人系统号'}
-    required_employee_columns = {'员工系统号', '三级组织', '四级组织', '花名'}
+    required_employee_columns = {'员工系统号', '一级组织', '三级组织', '四级组织', '花名'}
     
     if not required_flower_columns.issubset(flower_df.columns):
         missing = required_flower_columns - set(flower_df.columns)
@@ -70,20 +74,25 @@ def validate_data(flower_df, employee_df):
         raise ValueError(f"花名册数据缺少必要字段：{', '.join(missing)}")
 
 def process_step1(flower_df, employee_df):
-    """第一步数据处理"""
-    employee_dict = employee_df.set_index('员工系统号')[['三级组织', '四级组织', '花名']].to_dict('index')
+    """第一步数据处理（新增一级组织字段）"""
+    employee_dict = employee_df.set_index('员工系统号')[['一级组织', '三级组织', '四级组织', '花名']].to_dict('index')
     
     # 过滤有效记录
     valid_flower_df = flower_df[flower_df['收花人系统号'].isin(employee_dict)].copy()
     
-    # 添加收花人信息
+    # 添加收花人信息（调整字段顺序）
     valid_flower_df.insert(
         valid_flower_df.columns.get_loc('收花人系统号') + 1,
+        '收花人一级组织',
+        valid_flower_df['收花人系统号'].map(lambda x: employee_dict[x]['一级组织'])
+    )
+    valid_flower_df.insert(
+        valid_flower_df.columns.get_loc('收花人一级组织') + 1,
         '收花人三级组织',
         valid_flower_df['收花人系统号'].map(lambda x: employee_dict[x]['三级组织'])
     )
     valid_flower_df.insert(
-        valid_flower_df.columns.get_loc('收花人系统号') + 2,
+        valid_flower_df.columns.get_loc('收花人三级组织') + 1,
         '收花人四级组织',
         valid_flower_df['收花人系统号'].map(lambda x: employee_dict[x]['四级组织'])
     )
@@ -94,24 +103,39 @@ def process_step1(flower_df, employee_df):
     )
     
     # 添加送花人信息
+    valid_flower_df['送花人一级组织'] = valid_flower_df['送花人系统号'].map(
+        lambda x: employee_dict.get(x, {}).get('一级组织', ''))
     valid_flower_df['送花人三级组织'] = valid_flower_df['送花人系统号'].map(
         lambda x: employee_dict.get(x, {}).get('三级组织', ''))
-    
-    # 计算有效数量
-    valid_flower_df['有效数量'] = valid_flower_df.apply(
-        lambda row: st.session_state.weight if row['送花人三级组织'] == row['收花人三级组织'] else 1.0,
-        axis=1
-    )
+    valid_flower_df['送花人四级组织'] = valid_flower_df['送花人系统号'].map(
+        lambda x: employee_dict.get(x, {}).get('四级组织', ''))
     
     return valid_flower_df
 
 def process_step2(processed_df):
-    """第二步数据汇总"""
+    """第二步数据汇总（新增组织类型判断）"""
+    def calculate_effective(row):
+        # 总部规则
+        if row['收花人一级组织'] == '贝好家总部':
+            return st.session_state.weight if row['送花人三级组织'] == row['收花人三级组织'] else 1.0
+        # 城市规则
+        elif row['收花人一级组织'] == '贝好家城市':
+            same_dept = (row['送花人三级组织'] == row['收花人三级组织']) & \
+                       (row['送花人四级组织'] == row['收花人四级组织'])
+            return st.session_state.weight if same_dept else 1.0
+        # 其他情况
+        else:
+            return 1.0
+    
+    processed_df['有效数量'] = processed_df.apply(calculate_effective, axis=1)
+    
+    # 分组汇总
     summary_df = processed_df.groupby('收花人系统号').agg(
-        收花人姓名=('收花人姓名', 'first'),
-        收花人花名=('收花人花名', 'first'),
+        收花人一级组织=('收花人一级组织', 'first'),
         收花人三级组织=('收花人三级组织', 'first'),
         收花人四级组织=('收花人四级组织', 'first'),
+        收花人姓名=('收花人姓名', 'first'),
+        收花人花名=('收花人花名', 'first'),
         小红花数量=('有效数量', 'sum')
     ).reset_index()
     
@@ -120,15 +144,16 @@ def process_step2(processed_df):
     
     # 排序逻辑
     return summary_df.sort_values(
-        by=['小红花数量', '收花人三级组织'],
-        ascending=[False, True]
-    )[['收花人系统号', '收花人姓名', '收花人花名',
-      '收花人三级组织', '收花人四级组织', '小红花数量']]
+        by=['小红花数量', '收花人一级组织', '收花人三级组织'],
+        ascending=[False, True, True]
+    )[['收花人系统号', '收花人一级组织', '收花人三级组织',
+      '收花人四级组织', '收花人姓名', '收花人花名', '小红花数量']]
 
 def process_step3(summary_df):
-    """第三步结果格式化"""
+    """第三步结果格式化（新增一级组织排序）"""
     def format_people(group):
-        group = group.sort_values(['收花人三级组织', '收花人姓名'])
+        # 按一级组织、三级组织、姓名排序
+        group = group.sort_values(['收花人一级组织', '收花人三级组织', '收花人姓名'])
         result = []
         current_dept = None
         buffer = []
@@ -203,13 +228,15 @@ st.markdown("---")
 st.subheader("结果下载")
 
 def create_download_link(df, filename):
-    """生成下载链接"""
+    """生成下载链接（增强数值格式化）"""
     output = BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        # 格式化数值列
-        if '小红花数量' in df.columns:
-            df = df.round({'小红花数量': 1})
-        df.to_excel(writer, index=False, float_format="%.1f")
+        # 格式化所有数值列
+        styled_df = df.style.format({
+            '小红花数量': "{:.1f}",
+            '有效数量': "{:.1f}" if '有效数量' in df.columns else None
+        }, na_rep="")
+        styled_df.to_excel(writer, index=False)
     output.seek(0)
     b64 = base64.b64encode(output.read()).decode()
     return f'<a href="data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,{b64}" download="{filename}">点击下载</a>'
